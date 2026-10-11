@@ -4,6 +4,11 @@ import { REST } from '@discordjs/rest';
 import express from 'express';
 import cron from 'node-cron';
 
+const autodelete = require('./commands/autodelete');
+
+client.on('messageCreate', autodelete.handleMessage);
+client.once('clientReady', (c) => autodelete.resume(c)); // use 'ready' on older v14
+
 import config from './config/application.js';
 import { initializeDatabase } from './utils/database.js';
 import { getGuildConfig } from './services/config/guildConfig.js';
