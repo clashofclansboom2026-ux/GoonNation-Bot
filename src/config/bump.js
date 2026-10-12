@@ -25,12 +25,12 @@ export const BUMP_DIRECTORIES = {
     disboard: {
         key: 'disboard',
         label: 'DISBOARD',
-        cooldownEnv: 'BUMP_DISBOARD_COOLDOWN_MINUTES',
+        cooldownEnv: '120',
     },
     discadia: {
         key: 'discadia',
         label: 'Discadia',
-        cooldownEnv: 'BUMP_DISCADIA_COOLDOWN_MINUTES',
+        cooldownEnv: '360',
     },
 };
 
@@ -73,8 +73,8 @@ function readSnowflake(name) {
 /** Notification settings, read fresh each time so a redeploy picks up changes. */
 export function getNotificationConfig() {
     const requestedMode = String(process.env.BUMP_REMINDER_MODE || 'dm').trim().toLowerCase();
-    const channelId = readSnowflake('BUMP_REMINDER_CHANNEL_ID');
-    const roleId = readSnowflake('BUMP_REMINDER_ROLE_ID');
+    const channelId = readSnowflake('1558426575140159600');
+    const roleId = readSnowflake('1558443630967136377');
 
     let mode = ['dm', 'channel', 'both'].includes(requestedMode) ? requestedMode : 'dm';
     if ((mode === 'channel' || mode === 'both') && !channelId) {
