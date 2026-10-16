@@ -124,6 +124,11 @@ export function getGiveawayLockKey(messageId) {
     return `giveaway:lock:${messageId}`;
 }
 
+/** All sticky notes for a guild live in one document, keyed by channel ID. */
+export function getStickyKey(guildId) {
+    return `guild:${guildId}:sticky`;
+}
+
 /**
  * Legacy key patterns mapped to canonical builders.
  * Used by migration script and read-time fallback.

@@ -5,6 +5,7 @@ import { reconcileReactionRoleMessages } from "../services/reactionRoleService.j
 import { reconcileTicketPanels, reconcileVerificationPanels, reconcileReactionRolePanelHealth } from "../services/panelHealthService.js";
 import { reconcileLevelRoles } from "../services/leveling/levelRoleSyncService.js";
 import { initRiffyAfterReady } from "../services/music/riffySetup.js";
+import { reconcileStickies } from "../services/stickyService.js";
 
 export default {
   name: Events.ClientReady,
@@ -45,6 +46,11 @@ export default {
       const levelRoleSummary = await reconcileLevelRoles(client);
       startupLog(
         `Level role sync: scanned ${levelRoleSummary.scannedGuilds} guilds, pruned ${levelRoleSummary.prunedRewardEntries} stale rewards, re-awarded ${levelRoleSummary.rolesReAwarded} roles, errors ${levelRoleSummary.errors}`
+      );
+
+      const stickySummary = await reconcileStickies(client);
+      startupLog(
+        `Sticky notes: scanned ${stickySummary.scannedGuilds} guilds, ${stickySummary.stickies} stickies, reposted ${stickySummary.reposted}, removed ${stickySummary.removed}, errors ${stickySummary.errors}`
       );
     } catch (error) {
       logger.error("Error in ready event:", error);

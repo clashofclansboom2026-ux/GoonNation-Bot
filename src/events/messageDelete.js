@@ -3,6 +3,7 @@ import { logEvent, EVENT_TYPES } from '../services/loggingService.js';
 import { logger } from '../utils/logger.js';
 import { getReactionRoleMessage, deleteReactionRoleMessage } from '../services/reactionRoleService.js';
 import { formatLogLine } from '../utils/logging/logEmbeds.js';
+import { handleStickyMessageDeleted } from '../services/stickyService.js';
 
 const MAX_LOGGED_MESSAGE_CONTENT_LENGTH = 1024;
 
@@ -12,6 +13,9 @@ export default {
 
   async execute(message) {
     try {
+      // If the live sticky message was deleted, bring it back (never throws).
+      await handleStickyMessageDeleted(message, message.client);
+
       if (!message.guild) return;
 
       try {

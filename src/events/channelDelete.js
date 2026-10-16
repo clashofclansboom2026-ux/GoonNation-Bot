@@ -7,11 +7,13 @@ import {
 } from '../utils/database.js';
 import { getServerCounters, saveServerCounters } from '../services/serverstatsService.js';
 import { logger } from '../utils/logger.js';
+import { handleStickyChannelDeleted } from '../services/stickyService.js';
 
 export default {
     name: 'channelDelete',
     async execute(channel, client) {
-        
+        await handleStickyChannelDeleted(channel, client);
+
         if (channel.type === 0 && channel.guild) {
             try {
                 const ticketData = await getTicketData(channel.guild.id, channel.id);

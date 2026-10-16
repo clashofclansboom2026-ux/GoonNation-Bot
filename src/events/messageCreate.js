@@ -18,6 +18,7 @@ import {
   isValidCountingMessage,
   recordCorrectCount,
 } from '../services/countingGameService.js';
+import { notifyStickyMessage } from '../services/stickyService.js';
 
 const MESSAGE_XP_RATE_LIMIT_ATTEMPTS = 12;
 const MESSAGE_XP_RATE_LIMIT_WINDOW_MS = 10000;
@@ -26,6 +27,10 @@ export default {
   name: Events.MessageCreate,
   async execute(message, client) {
     try {
+      // Sticky notes react to every message (including other bots') so the sticky stays at the bottom.
+      // This is synchronous, cheap and never throws.
+      notifyStickyMessage(message, client);
+
       if (message.author.bot || !message.guild) return;
 
       logger.debug(`Message received from ${message.author.tag}: ${message.content}`);
