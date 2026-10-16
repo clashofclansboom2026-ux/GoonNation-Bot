@@ -1,0 +1,1681 @@
+From b2c122d53411c3264388979746d6bd57183f74da Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 20:35:14 +0100
+Subject: [PATCH] Add sticky notes: /sticky command, debounced repost service
+ and event hooks
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wk1K9uZhDXRaNou8b6VENL
+---
+ src/commands/Utility/sticky.js  | 578 +++++++++++++++++++
+ src/events/channelDelete.js     |   4 +-
+ src/events/messageCreate.js     |   5 +
+ src/events/messageDelete.js     |   4 +
+ src/events/messageDeleteBulk.js |  12 +
+ src/events/ready.js             |   6 +
+ src/services/stickyService.js   | 944 ++++++++++++++++++++++++++++++++
+ src/utils/database/keys.js      |   5 +
+ 8 files changed, 1557 insertions(+), 1 deletion(-)
+ create mode 100644 src/commands/Utility/sticky.js
+ create mode 100644 src/events/messageDeleteBulk.js
+ create mode 100644 src/services/stickyService.js
+
+diff --git a/src/commands/Utility/sticky.js b/src/commands/Utility/sticky.js
+new file mode 100644
+index 0000000..35c838b
+--- /dev/null
++++ b/src/commands/Utility/sticky.js
+@@ -0,0 +1,578 @@
++import {
++  SlashCommandBuilder,
++  PermissionFlagsBits,
++  ChannelType,
++  MessageFlags,
++  ModalBuilder,
++  TextInputBuilder,
++  TextInputStyle,
++  ActionRowBuilder,
++} from 'discord.js';
++import { createEmbed, successEmbed, infoEmbed, warningEmbed } from '../../utils/embeds.js';
++import { InteractionHelper } from '../../utils/interactionHelper.js';
++import { replyUserError, ErrorTypes } from '../../utils/errorHandler.js';
++import { logger } from '../../utils/logger.js';
++import {
++  STICKY_LIMITS,
++  StickyError,
++  isStickyChannel,
++  getSticky,
++  listStickies,
++  setSticky,
++  editSticky,
++  updateStickySettings,
++  setStickyEnabled,
++  removeSticky,
++  restoreStickyVersion,
++  repostSticky,
++  validateStickyInput,
++} from '../../services/stickyService.js';
++
++const MODAL_TIMEOUT_MS = 10 * 60_000;
++
++const channelOption = (option, description = 'Channel (defaults to this channel)') =>
++  option
++    .setName('channel')
++    .setDescription(description)
++    .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement);
++
++const styleOption = (option) =>
++  option
++    .setName('style')
++    .setDescription('How the sticky looks')
++    .addChoices({ name: 'Embed', value: 'embed' }, { name: 'Plain text', value: 'text' });
++
++const colorOption = (option) =>
++  option.setName('color').setDescription('Embed color as hex, e.g. #FFAA00');
++
++const delayOption = (option) =>
++  option
++    .setName('delay')
++    .setDescription('Seconds of quiet before the sticky moves back to the bottom (default 5)')
++    .setMinValue(STICKY_LIMITS.minDelaySec)
++    .setMaxValue(STICKY_LIMITS.maxDelaySec);
++
++const everyOption = (option) =>
++  option
++    .setName('every')
++    .setDescription('Only move the sticky after this many new messages (default 1)')
++    .setMinValue(STICKY_LIMITS.minEvery)
++    .setMaxValue(STICKY_LIMITS.maxEvery);
++
++export default {
++  slashOnly: true,
++  category: 'Utility',
++
++  data: new SlashCommandBuilder()
++    .setName('sticky')
++    .setDescription('Keep an important message at the bottom of a channel')
++    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
++    .setDMPermission(false)
++    .addSubcommand((sub) =>
++      sub
++        .setName('set')
++        .setDescription('Create (or replace) the sticky note in a channel')
++        .addChannelOption(channelOption)
++        .addStringOption(styleOption)
++        .addStringOption(colorOption)
++        .addIntegerOption(delayOption)
++        .addIntegerOption(everyOption),
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('edit')
++        .setDescription('Edit the text of a sticky note')
++        .addChannelOption(channelOption),
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('settings')
++        .setDescription('Change style, color, delay or frequency without touching the text')
++        .addChannelOption(channelOption)
++        .addStringOption(styleOption)
++        .addStringOption(colorOption)
++        .addIntegerOption(delayOption)
++        .addIntegerOption(everyOption),
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('remove')
++        .setDescription('Remove a sticky note and delete its message')
++        .addChannelOption(channelOption),
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('pause')
++        .setDescription('Temporarily take a sticky note down')
++        .addChannelOption(channelOption),
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('resume')
++        .setDescription('Put a paused sticky note back up')
++        .addChannelOption(channelOption),
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('refresh')
++        .setDescription('Repost the sticky note right now')
++        .addChannelOption(channelOption),
++    )
++    .addSubcommand((sub) =>
++      sub.setName('list').setDescription('Show every sticky note in this server'),
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('history')
++        .setDescription('Show previous versions of a sticky note')
++        .addChannelOption(channelOption),
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('restore')
++        .setDescription('Restore a previous version of a sticky note')
++        .addIntegerOption((option) =>
++          option
++            .setName('version')
++            .setDescription('Version number from /sticky history')
++            .setRequired(true)
++            .setMinValue(1)
++            .setMaxValue(STICKY_LIMITS.historySize),
++        )
++        .addChannelOption(channelOption),
++    ),
++
++  async execute(interaction) {
++    try {
++      if (!interaction.inGuild()) {
++        return await replyUserError(interaction, {
++          type: ErrorTypes.VALIDATION,
++          message: 'This command can only be used in a server.',
++        });
++      }
++
++      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
++        return await replyUserError(interaction, {
++          type: ErrorTypes.PERMISSION,
++          message: 'You need the **Manage Messages** permission to use this command.',
++        });
++      }
++
++      const subcommand = interaction.options.getSubcommand();
++      const channel = resolveChannel(interaction);
++      if (subcommand !== 'list' && !channel) {
++        return await replyUserError(interaction, {
++          type: ErrorTypes.VALIDATION,
++          message: 'Please choose a text or announcement channel.',
++        });
++      }
++
++      switch (subcommand) {
++        case 'set':
++          return await handleSet(interaction, channel);
++        case 'edit':
++          return await handleEdit(interaction, channel);
++        default:
++          break;
++      }
++
++      const deferred = await InteractionHelper.safeDefer(interaction, { flags: MessageFlags.Ephemeral });
++      if (!deferred) return;
++
++      switch (subcommand) {
++        case 'settings':
++          return await handleSettings(interaction, channel);
++        case 'remove':
++          return await handleRemove(interaction, channel);
++        case 'pause':
++          return await handlePauseResume(interaction, channel, false);
++        case 'resume':
++          return await handlePauseResume(interaction, channel, true);
++        case 'refresh':
++          return await handleRefresh(interaction, channel);
++        case 'list':
++          return await handleList(interaction);
++        case 'history':
++          return await handleHistory(interaction, channel);
++        case 'restore':
++          return await handleRestore(interaction, channel);
++        default:
++          return await replyUserError(interaction, {
++            type: ErrorTypes.VALIDATION,
++            message: 'Unknown sticky action.',
++          });
++      }
++    } catch (error) {
++      return await handleCommandError(interaction, error);
++    }
++  },
++};
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++function resolveChannel(interaction) {
++  const selected = interaction.options.getChannel('channel');
++  const channel = selected ?? interaction.channel;
++  return isStickyChannel(channel) ? channel : null;
++}
++
++function readOptions(interaction) {
++  return {
++    style: interaction.options.getString('style'),
++    color: interaction.options.getString('color'),
++    delaySec: interaction.options.getInteger('delay'),
++    everyN: interaction.options.getInteger('every'),
++  };
++}
++
++/** Returns a list of permission names the bot lacks in the channel (empty = fine). */
++function missingBotPermissions(interaction, channel, style = 'embed') {
++  const me = interaction.guild?.members?.me;
++  const perms = me ? channel.permissionsFor(me) : null;
++  if (!perms) return [];
++
++  const required = [
++    [PermissionFlagsBits.ViewChannel, 'View Channel'],
++    [PermissionFlagsBits.SendMessages, 'Send Messages'],
++  ];
++  if (style === 'embed') required.push([PermissionFlagsBits.EmbedLinks, 'Embed Links']);
++  return required.filter(([flag]) => !perms.has(flag)).map(([, name]) => name);
++}
++
++function preview(text, max = 70) {
++  const flat = String(text).replace(/\s+/g, ' ').trim();
++  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
++}
++
++function describeResult(result) {
++  switch (result?.reason) {
++    case 'posted':
++    case 'edited':
++      return null;
++    case 'permissions':
++      return `Saved, but I couldn't post it: I'm missing permissions in that channel (${(result.missing ?? []).join(', ') || 'Send Messages / Embed Links'}).`;
++    case 'send_failed':
++      return "Saved, but posting failed just now. It will retry when the next message arrives.";
++    case 'channel_missing':
++      return 'That channel no longer exists, so the sticky was removed.';
++    default:
++      return null;
++  }
++}
++
++function resultEmbed(title, body, result) {
++  const warning = describeResult(result);
++  return warning ? warningEmbed(title, `${body}\n\n⚠️ ${warning}`) : successEmbed(title, body);
++}
++
++async function handleCommandError(interaction, error) {
++  if (error instanceof StickyError) {
++    const type = error.code === 'DATABASE' ? ErrorTypes.DATABASE : ErrorTypes.VALIDATION;
++    return await replyUserError(interaction, { type, message: error.message });
++  }
++  logger.error('Sticky command error:', error);
++  return await replyUserError(interaction, {
++    type: ErrorTypes.UNKNOWN,
++    message: 'Something went wrong while managing the sticky note.',
++  });
++}
++
++/** Opens the editor modal and waits for it. Returns the submit interaction or null. */
++async function promptForContent(interaction, { title, defaultTitle = '', defaultContent = '' }) {
++  const modalId = `sticky_modal_${interaction.id}`;
++
++  const titleInput = new TextInputBuilder()
++    .setCustomId('sticky_title')
++    .setLabel('Title (optional)')
++    .setStyle(TextInputStyle.Short)
++    .setRequired(false)
++    .setMaxLength(STICKY_LIMITS.maxTitle);
++  if (defaultTitle) titleInput.setValue(defaultTitle.slice(0, STICKY_LIMITS.maxTitle));
++
++  const contentInput = new TextInputBuilder()
++    .setCustomId('sticky_content')
++    .setLabel('Sticky message')
++    .setStyle(TextInputStyle.Paragraph)
++    .setRequired(true)
++    .setMinLength(1)
++    .setMaxLength(STICKY_LIMITS.maxEmbedContent);
++  if (defaultContent) contentInput.setValue(defaultContent.slice(0, STICKY_LIMITS.maxEmbedContent));
++
++  const modal = new ModalBuilder()
++    .setCustomId(modalId)
++    .setTitle(title)
++    .addComponents(
++      new ActionRowBuilder().addComponents(titleInput),
++      new ActionRowBuilder().addComponents(contentInput),
++    );
++
++  const shown = await InteractionHelper.safeShowModal(interaction, modal);
++  if (!shown) return null;
++
++  return interaction
++    .awaitModalSubmit({
++      filter: (i) => i.customId === modalId && i.user.id === interaction.user.id,
++      time: MODAL_TIMEOUT_MS,
++    })
++    .catch(() => null);
++}
++
++// ---------------------------------------------------------------------------
++// Subcommands
++// ---------------------------------------------------------------------------
++
++async function handleSet(interaction, channel) {
++  const options = readOptions(interaction);
++
++  // Validate the cheap options before opening the modal so mistakes show up immediately.
++  const checked = validateStickyInput(options);
++  const existing = await getSticky(interaction.client, interaction.guildId, channel.id);
++  const style = checked.style ?? existing?.style ?? 'embed';
++
++  const missing = missingBotPermissions(interaction, channel, style);
++  if (missing.length > 0) {
++    return await replyUserError(interaction, {
++      type: ErrorTypes.PERMISSION,
++      message: `I need these permissions in ${channel}: **${missing.join(', ')}**.`,
++    });
++  }
++
++  const submitted = await promptForContent(interaction, {
++    title: existing ? 'Replace Sticky Note' : 'New Sticky Note',
++    defaultTitle: existing?.title ?? '',
++    defaultContent: existing?.content ?? '',
++  });
++  if (!submitted) return;
++
++  await submitted.deferReply({ flags: MessageFlags.Ephemeral });
++
++  try {
++    const { result } = await setSticky(
++      interaction.client,
++      interaction.guildId,
++      channel.id,
++      {
++        ...options,
++        title: submitted.fields.getTextInputValue('sticky_title'),
++        content: submitted.fields.getTextInputValue('sticky_content'),
++      },
++      interaction.user.id,
++    );
++
++    await submitted.editReply({
++      embeds: [
++        resultEmbed(
++          existing ? 'Sticky Note Replaced' : 'Sticky Note Created',
++          `The sticky in ${channel} is set. When people chat, it moves back to the bottom after ${options.delaySec ?? existing?.delaySec ?? STICKY_LIMITS.defaultDelaySec}s of quiet.`,
++          result,
++        ),
++      ],
++    });
++  } catch (error) {
++    await replyToSubmitError(submitted, error);
++  }
++}
++
++async function handleEdit(interaction, channel) {
++  const existing = await getSticky(interaction.client, interaction.guildId, channel.id);
++  if (!existing) {
++    return await replyUserError(interaction, {
++      type: ErrorTypes.VALIDATION,
++      message: `There is no sticky note in ${channel}. Create one with \`/sticky set\`.`,
++    });
++  }
++
++  const submitted = await promptForContent(interaction, {
++    title: 'Edit Sticky Note',
++    defaultTitle: existing.title,
++    defaultContent: existing.content,
++  });
++  if (!submitted) return;
++
++  await submitted.deferReply({ flags: MessageFlags.Ephemeral });
++
++  try {
++    const { result } = await editSticky(
++      interaction.client,
++      interaction.guildId,
++      channel.id,
++      {
++        title: submitted.fields.getTextInputValue('sticky_title'),
++        content: submitted.fields.getTextInputValue('sticky_content'),
++      },
++      interaction.user.id,
++    );
++
++    await submitted.editReply({
++      embeds: [resultEmbed('Sticky Note Updated', `The sticky in ${channel} has been updated. The previous version was saved (see \`/sticky history\`).`, result)],
++    });
++  } catch (error) {
++    await replyToSubmitError(submitted, error);
++  }
++}
++
++async function replyToSubmitError(submitted, error) {
++  let message = 'Something went wrong while saving the sticky note.';
++  if (error instanceof StickyError) {
++    message = error.message;
++  } else {
++    logger.error('Sticky modal submit error:', error);
++  }
++  await submitted
++    .editReply({ embeds: [warningEmbed('Sticky Note Not Saved', message)] })
++    .catch(() => {});
++}
++
++async function handleSettings(interaction, channel) {
++  const options = readOptions(interaction);
++  if (Object.values(options).every((value) => value === null)) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed('Nothing To Change', 'Pick at least one of: style, color, delay, every.')],
++    });
++  }
++
++  const { result } = await updateStickySettings(
++    interaction.client,
++    interaction.guildId,
++    channel.id,
++    options,
++    interaction.user.id,
++  );
++
++  return await InteractionHelper.safeEditReply(interaction, {
++    embeds: [resultEmbed('Sticky Settings Updated', `Settings for the sticky in ${channel} were saved.`, result)],
++  });
++}
++
++async function handleRemove(interaction, channel) {
++  const removed = await removeSticky(interaction.client, interaction.guildId, channel.id);
++  if (!removed) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed('No Sticky Note', `There is no sticky note in ${channel}.`)],
++    });
++  }
++  return await InteractionHelper.safeEditReply(interaction, {
++    embeds: [successEmbed('Sticky Note Removed', `The sticky in ${channel} was removed.`)],
++  });
++}
++
++async function handlePauseResume(interaction, channel, enable) {
++  const existing = await getSticky(interaction.client, interaction.guildId, channel.id);
++  if (!existing) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed('No Sticky Note', `There is no sticky note in ${channel}.`)],
++    });
++  }
++  if (existing.enabled === enable) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed(enable ? 'Already Active' : 'Already Paused', `The sticky in ${channel} is already ${enable ? 'active' : 'paused'}.`)],
++    });
++  }
++
++  const { result } = await setStickyEnabled(
++    interaction.client,
++    interaction.guildId,
++    channel.id,
++    enable,
++    interaction.user.id,
++  );
++
++  return await InteractionHelper.safeEditReply(interaction, {
++    embeds: [
++      enable
++        ? resultEmbed('Sticky Note Resumed', `The sticky in ${channel} is back up.`, result)
++        : successEmbed('Sticky Note Paused', `The sticky in ${channel} was taken down. Use \`/sticky resume\` to put it back.`),
++    ],
++  });
++}
++
++async function handleRefresh(interaction, channel) {
++  const existing = await getSticky(interaction.client, interaction.guildId, channel.id);
++  if (!existing) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed('No Sticky Note', `There is no sticky note in ${channel}.`)],
++    });
++  }
++  if (!existing.enabled) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed('Sticky Note Paused', 'Resume it first with `/sticky resume`.')],
++    });
++  }
++
++  const result = await repostSticky(interaction.client, interaction.guildId, channel.id, { force: true });
++  return await InteractionHelper.safeEditReply(interaction, {
++    embeds: [resultEmbed('Sticky Note Refreshed', `The sticky in ${channel} was reposted.`, result)],
++  });
++}
++
++async function handleList(interaction) {
++  const stickies = await listStickies(interaction.client, interaction.guildId);
++  if (stickies.length === 0) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed('No Sticky Notes', 'This server has no sticky notes yet. Create one with `/sticky set`.')],
++    });
++  }
++
++  const lines = stickies.map((sticky) => {
++    const status = sticky.enabled ? '🟢' : '⏸️';
++    const pace = `${sticky.style} · ${sticky.delaySec}s · every ${sticky.everyN}`;
++    return `${status} <#${sticky.channelId}> — ${pace}\n> ${preview(sticky.content)}`;
++  });
++
++  return await InteractionHelper.safeEditReply(interaction, {
++    embeds: [
++      createEmbed({
++        title: `Sticky Notes (${stickies.length}/${STICKY_LIMITS.maxPerGuild})`,
++        description: lines.join('\n').slice(0, 4000),
++        color: 'primary',
++      }),
++    ],
++  });
++}
++
++async function handleHistory(interaction, channel) {
++  const existing = await getSticky(interaction.client, interaction.guildId, channel.id);
++  if (!existing) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed('No Sticky Note', `There is no sticky note in ${channel}.`)],
++    });
++  }
++  if (existing.history.length === 0) {
++    return await InteractionHelper.safeEditReply(interaction, {
++      embeds: [infoEmbed('No History Yet', 'Previous versions appear here after the sticky is edited or replaced.')],
++    });
++  }
++
++  const lines = existing.history.map((entry, index) => {
++    const when = `<t:${Math.floor(entry.at / 1000)}:R>`;
++    const by = entry.editedBy ? ` by <@${entry.editedBy}>` : '';
++    return `**${index + 1}.** ${when}${by}\n> ${preview(entry.title ? `${entry.title} — ${entry.content}` : entry.content, 90)}`;
++  });
++
++  return await InteractionHelper.safeEditReply(interaction, {
++    embeds: [
++      createEmbed({
++        title: `Sticky History — #${channel.name}`,
++        description: `${lines.join('\n')}\n\nRestore one with \`/sticky restore version:<number>\`.`.slice(0, 4000),
++        color: 'primary',
++      }),
++    ],
++  });
++}
++
++async function handleRestore(interaction, channel) {
++  const version = interaction.options.getInteger('version', true);
++  const { result } = await restoreStickyVersion(
++    interaction.client,
++    interaction.guildId,
++    channel.id,
++    version,
++    interaction.user.id,
++  );
++
++  return await InteractionHelper.safeEditReply(interaction, {
++    embeds: [resultEmbed('Version Restored', `Version ${version} is now the sticky in ${channel}. The text it replaced was saved to history.`, result)],
++  });
++}
+diff --git a/src/events/channelDelete.js b/src/events/channelDelete.js
+index c8fd68f..4e681f4 100644
+--- a/src/events/channelDelete.js
++++ b/src/events/channelDelete.js
+@@ -7,11 +7,13 @@ import {
+ } from '../utils/database.js';
+ import { getServerCounters, saveServerCounters } from '../services/serverstatsService.js';
+ import { logger } from '../utils/logger.js';
++import { handleStickyChannelDeleted } from '../services/stickyService.js';
+ 
+ export default {
+     name: 'channelDelete',
+     async execute(channel, client) {
+-        
++        await handleStickyChannelDeleted(channel, client);
++
+         if (channel.type === 0 && channel.guild) {
+             try {
+                 const ticketData = await getTicketData(channel.guild.id, channel.id);
+diff --git a/src/events/messageCreate.js b/src/events/messageCreate.js
+index fb1a165..0ba6543 100644
+--- a/src/events/messageCreate.js
++++ b/src/events/messageCreate.js
+@@ -18,6 +18,7 @@ import {
+   isValidCountingMessage,
+   recordCorrectCount,
+ } from '../services/countingGameService.js';
++import { notifyStickyMessage } from '../services/stickyService.js';
+ 
+ const MESSAGE_XP_RATE_LIMIT_ATTEMPTS = 12;
+ const MESSAGE_XP_RATE_LIMIT_WINDOW_MS = 10000;
+@@ -26,6 +27,10 @@ export default {
+   name: Events.MessageCreate,
+   async execute(message, client) {
+     try {
++      // Sticky notes react to every message (including other bots') so the sticky stays at the bottom.
++      // This is synchronous, cheap and never throws.
++      notifyStickyMessage(message, client);
++
+       if (message.author.bot || !message.guild) return;
+ 
+       logger.debug(`Message received from ${message.author.tag}: ${message.content}`);
+diff --git a/src/events/messageDelete.js b/src/events/messageDelete.js
+index 54d7a9c..d2ae9eb 100644
+--- a/src/events/messageDelete.js
++++ b/src/events/messageDelete.js
+@@ -3,6 +3,7 @@ import { logEvent, EVENT_TYPES } from '../services/loggingService.js';
+ import { logger } from '../utils/logger.js';
+ import { getReactionRoleMessage, deleteReactionRoleMessage } from '../services/reactionRoleService.js';
+ import { formatLogLine } from '../utils/logging/logEmbeds.js';
++import { handleStickyMessageDeleted } from '../services/stickyService.js';
+ 
+ const MAX_LOGGED_MESSAGE_CONTENT_LENGTH = 1024;
+ 
+@@ -12,6 +13,9 @@ export default {
+ 
+   async execute(message) {
+     try {
++      // If the live sticky message was deleted, bring it back (never throws).
++      await handleStickyMessageDeleted(message, message.client);
++
+       if (!message.guild) return;
+ 
+       try {
+diff --git a/src/events/messageDeleteBulk.js b/src/events/messageDeleteBulk.js
+new file mode 100644
+index 0000000..b8443e3
+--- /dev/null
++++ b/src/events/messageDeleteBulk.js
+@@ -0,0 +1,12 @@
++import { Events } from 'discord.js';
++import { handleStickyBulkDelete } from '../services/stickyService.js';
++
++// Fires when messages are purged in bulk (e.g. /purge). If the live sticky was among them, bring it back.
++export default {
++  name: Events.MessageBulkDelete,
++  once: false,
++
++  async execute(messages, channel, client) {
++    await handleStickyBulkDelete(messages, channel, client);
++  },
++};
+diff --git a/src/events/ready.js b/src/events/ready.js
+index 2be8e5e..f06871a 100644
+--- a/src/events/ready.js
++++ b/src/events/ready.js
+@@ -5,6 +5,7 @@ import { reconcileReactionRoleMessages } from "../services/reactionRoleService.j
+ import { reconcileTicketPanels, reconcileVerificationPanels, reconcileReactionRolePanelHealth } from "../services/panelHealthService.js";
+ import { reconcileLevelRoles } from "../services/leveling/levelRoleSyncService.js";
+ import { initRiffyAfterReady } from "../services/music/riffySetup.js";
++import { reconcileStickies } from "../services/stickyService.js";
+ 
+ export default {
+   name: Events.ClientReady,
+@@ -46,6 +47,11 @@ export default {
+       startupLog(
+         `Level role sync: scanned ${levelRoleSummary.scannedGuilds} guilds, pruned ${levelRoleSummary.prunedRewardEntries} stale rewards, re-awarded ${levelRoleSummary.rolesReAwarded} roles, errors ${levelRoleSummary.errors}`
+       );
++
++      const stickySummary = await reconcileStickies(client);
++      startupLog(
++        `Sticky notes: scanned ${stickySummary.scannedGuilds} guilds, ${stickySummary.stickies} stickies, reposted ${stickySummary.reposted}, removed ${stickySummary.removed}, errors ${stickySummary.errors}`
++      );
+     } catch (error) {
+       logger.error("Error in ready event:", error);
+     }
+diff --git a/src/services/stickyService.js b/src/services/stickyService.js
+new file mode 100644
+index 0000000..52abef7
+--- /dev/null
++++ b/src/services/stickyService.js
+@@ -0,0 +1,944 @@
++import { ChannelType, PermissionFlagsBits } from 'discord.js';
++import { logger } from '../utils/logger.js';
++import { Mutex } from '../utils/mutex.js';
++import { getStickyKey } from '../utils/database/keys.js';
++import { createEmbed } from '../utils/embeds.js';
++
++/**
++ * Sticky notes: a message the bot keeps as the most recent message in a channel.
++ *
++ * Design notes (why it is built this way):
++ * - One document per guild (`guild:<id>:sticky`) holding every channel's sticky, cached in memory,
++ *   so the hot path (every incoming message) is a single Map lookup and never touches the database.
++ * - Reposts are debounced (with a max-wait cap so busy chats still get a repost) and serialized per
++ *   channel with a mutex, so bursts of messages can never create duplicate stickies.
++ * - The new sticky is SENT before the old one is deleted, so a failed send never leaves a channel
++ *   without its sticky.
++ * - Config writes are serialized per guild and always go through `mutateGuild`.
++ * - Lock order is always: post lock (`sticky-post:<channel>`) -> store lock (`sticky-store:<guild>`).
++ *   Store-lock holders never take a post lock, so the two cannot deadlock.
++ * - Mentions in sticky text never ping (`allowedMentions.parse = []`).
++ */
++
++export const STICKY_LIMITS = Object.freeze({
++  maxPerGuild: 25,
++  maxEmbedContent: 4000,
++  maxTextContent: 1900,
++  maxTitle: 100,
++  minDelaySec: 2,
++  maxDelaySec: 60,
++  defaultDelaySec: 5,
++  minEvery: 1,
++  maxEvery: 50,
++  defaultEvery: 1,
++  historySize: 5,
++});
++
++const MAX_WAIT_MS = 30_000;
++const NEGATIVE_CACHE_MS = 15_000;
++const PERMISSION_WARN_INTERVAL_MS = 10 * 60_000;
++const MAX_FAILURE_BACKOFF_MS = 10 * 60_000;
++const OWN_ID_MEMORY = 10;
++
++const STICKY_CHANNEL_TYPES = new Set([ChannelType.GuildText, ChannelType.GuildAnnouncement]);
++
++const DISCORD_UNKNOWN_CHANNEL = 10003;
++const DISCORD_UNKNOWN_MESSAGE = 10008;
++const DISCORD_MISSING_ACCESS = 50001;
++const DISCORD_MISSING_PERMISSIONS = 50013;
++
++export class StickyError extends Error {
++  constructor(code, message) {
++    super(message);
++    this.name = 'StickyError';
++    this.code = code;
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Normalisation / validation
++// ---------------------------------------------------------------------------
++
++function clampInt(value, min, max, fallback) {
++  const n = Number(value);
++  if (!Number.isFinite(n)) return fallback;
++  return Math.min(max, Math.max(min, Math.trunc(n)));
++}
++
++export function normalizeColor(value) {
++  if (value === null || value === undefined || value === '') return null;
++  const match = String(value).trim().match(/^(?:#|0x)?([0-9a-fA-F]{6})$/);
++  return match ? `#${match[1].toUpperCase()}` : null;
++}
++
++function isHistoryEntry(entry) {
++  return entry && typeof entry === 'object' && typeof entry.content === 'string' && entry.content.length > 0;
++}
++
++function normalizeSticky(raw, channelId) {
++  if (!raw || typeof raw !== 'object') return null;
++  if (typeof raw.content !== 'string' || raw.content.trim().length === 0) return null;
++
++  return {
++    channelId,
++    content: raw.content,
++    title: typeof raw.title === 'string' ? raw.title.slice(0, STICKY_LIMITS.maxTitle) : '',
++    style: raw.style === 'text' ? 'text' : 'embed',
++    color: normalizeColor(raw.color),
++    enabled: raw.enabled !== false,
++    delaySec: clampInt(raw.delaySec, STICKY_LIMITS.minDelaySec, STICKY_LIMITS.maxDelaySec, STICKY_LIMITS.defaultDelaySec),
++    everyN: clampInt(raw.everyN, STICKY_LIMITS.minEvery, STICKY_LIMITS.maxEvery, STICKY_LIMITS.defaultEvery),
++    lastMessageId: typeof raw.lastMessageId === 'string' && raw.lastMessageId ? raw.lastMessageId : null,
++    createdBy: typeof raw.createdBy === 'string' ? raw.createdBy : null,
++    createdAt: Number(raw.createdAt) || Date.now(),
++    updatedAt: Number(raw.updatedAt) || Date.now(),
++    updatedBy: typeof raw.updatedBy === 'string' ? raw.updatedBy : null,
++    history: Array.isArray(raw.history)
++      ? raw.history.filter(isHistoryEntry).slice(0, STICKY_LIMITS.historySize)
++      : [],
++  };
++}
++
++function normalizeGuildDoc(raw) {
++  const doc = { version: 1, stickies: {} };
++  if (!raw || typeof raw !== 'object' || !raw.stickies || typeof raw.stickies !== 'object') {
++    return doc;
++  }
++  for (const [channelId, value] of Object.entries(raw.stickies)) {
++    const sticky = normalizeSticky(value, channelId);
++    if (sticky) doc.stickies[channelId] = sticky;
++  }
++  return doc;
++}
++
++/**
++ * Validates and normalises user-supplied sticky fields. Throws StickyError on bad input.
++ * Only keys present in `input` are returned so callers can use it for partial updates.
++ */
++export function validateStickyInput(input, { requireContent = false, styleForLengthCheck = 'embed' } = {}) {
++  const out = {};
++
++  if (input.style !== undefined && input.style !== null) {
++    if (input.style !== 'text' && input.style !== 'embed') {
++      throw new StickyError('VALIDATION', 'Style must be either **text** or **embed**.');
++    }
++    out.style = input.style;
++  }
++
++  if (input.title !== undefined && input.title !== null) {
++    const title = String(input.title).trim();
++    if (title.length > STICKY_LIMITS.maxTitle) {
++      throw new StickyError('VALIDATION', `Title can be at most ${STICKY_LIMITS.maxTitle} characters.`);
++    }
++    out.title = title;
++  }
++
++  if (input.content !== undefined && input.content !== null) {
++    const content = String(input.content).replace(/\r\n/g, '\n').trim();
++    if (content.length === 0) {
++      throw new StickyError('VALIDATION', 'The sticky message cannot be empty.');
++    }
++    out.content = content;
++  } else if (requireContent) {
++    throw new StickyError('VALIDATION', 'The sticky message cannot be empty.');
++  }
++
++  if (input.color !== undefined && input.color !== null && input.color !== '') {
++    const color = normalizeColor(input.color);
++    if (!color) {
++      throw new StickyError('VALIDATION', 'Color must be a hex code like `#FFAA00`.');
++    }
++    out.color = color;
++  }
++
++  if (input.delaySec !== undefined && input.delaySec !== null) {
++    const n = Number(input.delaySec);
++    if (!Number.isInteger(n) || n < STICKY_LIMITS.minDelaySec || n > STICKY_LIMITS.maxDelaySec) {
++      throw new StickyError(
++        'VALIDATION',
++        `Delay must be a whole number between ${STICKY_LIMITS.minDelaySec} and ${STICKY_LIMITS.maxDelaySec} seconds.`,
++      );
++    }
++    out.delaySec = n;
++  }
++
++  if (input.everyN !== undefined && input.everyN !== null) {
++    const n = Number(input.everyN);
++    if (!Number.isInteger(n) || n < STICKY_LIMITS.minEvery || n > STICKY_LIMITS.maxEvery) {
++      throw new StickyError(
++        'VALIDATION',
++        `"Every" must be a whole number between ${STICKY_LIMITS.minEvery} and ${STICKY_LIMITS.maxEvery} messages.`,
++      );
++    }
++    out.everyN = n;
++  }
++
++  const style = out.style ?? styleForLengthCheck;
++  if (out.content !== undefined) {
++    if (style === 'text') {
++      const total = out.content.length + (out.title ? out.title.length + 8 : 0);
++      if (total > STICKY_LIMITS.maxTextContent) {
++        throw new StickyError(
++          'VALIDATION',
++          `Text stickies can be at most ${STICKY_LIMITS.maxTextContent} characters (including the title). Use the embed style for longer notes.`,
++        );
++      }
++    } else if (out.content.length > STICKY_LIMITS.maxEmbedContent) {
++      throw new StickyError('VALIDATION', `Embed stickies can be at most ${STICKY_LIMITS.maxEmbedContent} characters.`);
++    }
++  }
++
++  return out;
++}
++
++export function isStickyChannel(channel) {
++  return Boolean(channel) && STICKY_CHANNEL_TYPES.has(channel.type);
++}
++
++// ---------------------------------------------------------------------------
++// Storage (cached per guild)
++// ---------------------------------------------------------------------------
++
++const guildCache = new Map(); // guildId -> { data, ok, loadedAt }
++const inflightLoads = new Map(); // guildId -> Promise<data>
++
++function peekGuild(guildId) {
++  const cached = guildCache.get(guildId);
++  if (!cached) return undefined;
++  if (cached.ok || Date.now() - cached.loadedAt < NEGATIVE_CACHE_MS) return cached.data;
++  return undefined;
++}
++
++async function loadGuild(client, guildId) {
++  const cached = peekGuild(guildId);
++  if (cached) return cached;
++
++  const existing = inflightLoads.get(guildId);
++  if (existing) return existing;
++
++  const promise = (async () => {
++    try {
++      const raw = await client.db.get(getStickyKey(guildId), null);
++      const data = normalizeGuildDoc(raw);
++      guildCache.set(guildId, { data, ok: true, loadedAt: Date.now() });
++      return data;
++    } catch (error) {
++      logger.error('Failed to load sticky notes', { guildId, error });
++      // Negative-cache an empty doc briefly so a DB outage doesn't turn every message into a DB call.
++      // `ok: false` also guarantees this empty doc is never used as the base for a write.
++      const empty = normalizeGuildDoc(null);
++      guildCache.set(guildId, { data: empty, ok: false, loadedAt: Date.now() });
++      return empty;
++    } finally {
++      inflightLoads.delete(guildId);
++    }
++  })();
++
++  inflightLoads.set(guildId, promise);
++  return promise;
++}
++
++async function loadForWrite(client, guildId) {
++  const cached = guildCache.get(guildId);
++  if (cached?.ok) return cached.data;
++
++  try {
++    const raw = await client.db.get(getStickyKey(guildId), null);
++    return normalizeGuildDoc(raw);
++  } catch (error) {
++    logger.error('Failed to read sticky notes before writing', { guildId, error });
++    throw new StickyError('DATABASE', 'Could not reach the database. Please try again in a moment.');
++  }
++}
++
++/**
++ * Runs `mutator(draft, ctx)` against a copy of the guild document under the guild's store lock,
++ * persists the copy and swaps it into the cache. Set `ctx.skipWrite = true` to abort without saving.
++ */
++async function mutateGuild(client, guildId, mutator) {
++  return Mutex.runExclusive(`sticky-store:${guildId}`, async () => {
++    const base = await loadForWrite(client, guildId);
++    const draft = structuredClone(base);
++    const ctx = { skipWrite: false };
++    const result = await mutator(draft, ctx);
++
++    if (ctx.skipWrite) return result;
++
++    let saved;
++    try {
++      saved = await client.db.set(getStickyKey(guildId), draft);
++    } catch (error) {
++      logger.error('Failed to save sticky notes', { guildId, error });
++      throw new StickyError('DATABASE', 'Could not save the sticky note. Please try again.');
++    }
++    if (saved === false) {
++      throw new StickyError('DATABASE', 'Could not save the sticky note. Please try again.');
++    }
++
++    guildCache.set(guildId, { data: draft, ok: true, loadedAt: Date.now() });
++    return result;
++  });
++}
++
++export async function getSticky(client, guildId, channelId) {
++  const data = await loadGuild(client, guildId);
++  return data.stickies[channelId] ?? null;
++}
++
++export async function listStickies(client, guildId) {
++  const data = await loadGuild(client, guildId);
++  return Object.values(data.stickies).sort((a, b) => a.createdAt - b.createdAt);
++}
++
++// ---------------------------------------------------------------------------
++// Runtime state (never persisted)
++// ---------------------------------------------------------------------------
++
++const channelState = new Map();
++
++function getState(channelId) {
++  let state = channelState.get(channelId);
++  if (!state) {
++    state = {
++      timer: null,
++      pending: 0,
++      firstPendingAt: 0,
++      busy: false,
++      rerun: false,
++      lastMessageId: null, // in-memory fallback if persisting the id fails
++      ownIds: [],
++      failures: 0,
++      blockedUntil: 0,
++      lastPermissionWarnAt: 0,
++    };
++    channelState.set(channelId, state);
++  }
++  return state;
++}
++
++function rememberOwnId(state, id) {
++  state.ownIds.push(id);
++  if (state.ownIds.length > OWN_ID_MEMORY) state.ownIds.shift();
++}
++
++function clearChannelTimer(state) {
++  if (state.timer) {
++    clearTimeout(state.timer);
++    state.timer = null;
++  }
++  state.pending = 0;
++  state.firstPendingAt = 0;
++}
++
++export function clearChannelState(channelId) {
++  const state = channelState.get(channelId);
++  if (state) clearChannelTimer(state);
++  channelState.delete(channelId);
++}
++
++// ---------------------------------------------------------------------------
++// Message building
++// ---------------------------------------------------------------------------
++
++export function buildStickyPayload(sticky) {
++  const allowedMentions = { parse: [] };
++
++  if (sticky.style === 'text') {
++    const header = sticky.title ? `📌 **${sticky.title}**\n` : '';
++    return {
++      content: `${header}${sticky.content}`.slice(0, 2000),
++      embeds: [],
++      allowedMentions,
++    };
++  }
++
++  const embed = createEmbed({
++    title: sticky.title || '📌 Sticky Note',
++    description: sticky.content,
++    color: sticky.color || 'primary',
++  });
++  return { content: '', embeds: [embed], allowedMentions };
++}
++
++// ---------------------------------------------------------------------------
++// Discord helpers
++// ---------------------------------------------------------------------------
++
++async function resolveChannel(client, guildId, channelId) {
++  let channel = client.channels.cache.get(channelId);
++
++  if (!channel) {
++    try {
++      channel = await client.channels.fetch(channelId);
++    } catch (error) {
++      if (error?.code === DISCORD_UNKNOWN_CHANNEL) return { channel: null, missing: true };
++      if (error?.code === DISCORD_MISSING_ACCESS) return { channel: null, missing: false, noAccess: true };
++      throw error;
++    }
++  }
++
++  if (!channel || channel.guildId !== guildId || !isStickyChannel(channel)) {
++    return { channel: null, missing: true };
++  }
++  return { channel, missing: false };
++}
++
++function missingPostingPermissions(channel, sticky) {
++  const me = channel.guild?.members?.me;
++  if (!me) return [];
++
++  const perms = channel.permissionsFor(me);
++  if (!perms) return ['View Channel'];
++
++  const required = [
++    [PermissionFlagsBits.ViewChannel, 'View Channel'],
++    [PermissionFlagsBits.SendMessages, 'Send Messages'],
++  ];
++  if (sticky.style === 'embed') {
++    required.push([PermissionFlagsBits.EmbedLinks, 'Embed Links']);
++  }
++  return required.filter(([flag]) => !perms.has(flag)).map(([, name]) => name);
++}
++
++async function deleteMessageQuietly(channel, messageId) {
++  if (!messageId) return;
++  try {
++    await channel.messages.delete(messageId);
++  } catch (error) {
++    if (error?.code === DISCORD_UNKNOWN_MESSAGE) return;
++    logger.debug('Could not delete old sticky message', { channelId: channel.id, messageId, error: error?.message });
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Reposting
++// ---------------------------------------------------------------------------
++
++async function persistLastMessageId(client, guildId, channelId, messageId) {
++  await mutateGuild(client, guildId, (draft, ctx) => {
++    const sticky = draft.stickies[channelId];
++    if (!sticky || sticky.lastMessageId === messageId) {
++      ctx.skipWrite = true;
++      return;
++    }
++    sticky.lastMessageId = messageId;
++  });
++}
++
++/**
++ * Makes sure the channel's sticky is posted as the latest message.
++ * `force` re-posts even when the sticky already is the latest message (used after edits / manual refresh).
++ * Never throws; returns `{ posted, reason }`.
++ */
++export async function repostSticky(client, guildId, channelId, { force = false } = {}) {
++  try {
++    return await Mutex.runExclusive(`sticky-post:${channelId}`, () =>
++      repostLocked(client, guildId, channelId, force),
++    );
++  } catch (error) {
++    logger.error('Unexpected error while reposting sticky', { guildId, channelId, error });
++    return { posted: false, reason: 'error' };
++  }
++}
++
++async function repostLocked(client, guildId, channelId, force) {
++  const state = getState(channelId);
++  state.busy = true;
++
++  try {
++    const data = await loadGuild(client, guildId);
++    const sticky = data.stickies[channelId];
++    if (!sticky || !sticky.enabled) return { posted: false, reason: 'inactive' };
++
++    const resolved = await resolveChannel(client, guildId, channelId);
++    if (resolved.missing) {
++      logger.info('Sticky channel no longer exists, removing sticky', { guildId, channelId });
++      await removeStickyConfigOnly(client, guildId, channelId);
++      return { posted: false, reason: 'channel_missing' };
++    }
++    const channel = resolved.channel;
++    if (!channel) return { posted: false, reason: 'no_access' };
++
++    const missing = missingPostingPermissions(channel, sticky);
++    if (missing.length > 0) {
++      warnMissingPermissions(state, guildId, channelId, missing);
++      return { posted: false, reason: 'permissions', missing };
++    }
++
++    const knownId = state.lastMessageId || sticky.lastMessageId;
++    const isLatest = Boolean(knownId) && channel.lastMessageId === knownId;
++
++    if (isLatest && !force) return { posted: false, reason: 'already_latest' };
++
++    const payload = buildStickyPayload(sticky);
++
++    // Nothing was posted after the sticky: update it in place (no flicker, keeps its position).
++    if (isLatest && force) {
++      try {
++        await channel.messages.edit(knownId, payload);
++        state.failures = 0;
++        return { posted: true, reason: 'edited', messageId: knownId };
++      } catch (error) {
++        if (error?.code !== DISCORD_UNKNOWN_MESSAGE) {
++          logger.debug('In-place sticky edit failed, reposting instead', { channelId, error: error?.message });
++        }
++      }
++    }
++
++    let sent;
++    try {
++      sent = await channel.send(payload);
++    } catch (error) {
++      return handleSendFailure(client, state, guildId, channelId, error);
++    }
++
++    state.failures = 0;
++    state.blockedUntil = 0;
++    rememberOwnId(state, sent.id);
++
++    const staleIds = new Set([sticky.lastMessageId, state.lastMessageId].filter(Boolean));
++    state.lastMessageId = sent.id;
++
++    try {
++      await persistLastMessageId(client, guildId, channelId, sent.id);
++    } catch (error) {
++      // The in-memory id keeps cleanup correct until the next successful save.
++      logger.warn('Could not persist sticky message id', { guildId, channelId, error: error?.message });
++    }
++
++    for (const id of staleIds) {
++      if (id !== sent.id) await deleteMessageQuietly(channel, id);
++    }
++
++    return { posted: true, reason: 'posted', messageId: sent.id };
++  } finally {
++    state.busy = false;
++    if (state.rerun) {
++      state.rerun = false;
++      scheduleRepost(client, guildId, channelId, STICKY_LIMITS.defaultDelaySec * 1000);
++    }
++  }
++}
++
++function warnMissingPermissions(state, guildId, channelId, missing) {
++  const now = Date.now();
++  if (now - state.lastPermissionWarnAt < PERMISSION_WARN_INTERVAL_MS) return;
++  state.lastPermissionWarnAt = now;
++  logger.warn('Cannot post sticky: missing permissions', { guildId, channelId, missing });
++}
++
++async function handleSendFailure(client, state, guildId, channelId, error) {
++  if (error?.code === DISCORD_UNKNOWN_CHANNEL) {
++    await removeStickyConfigOnly(client, guildId, channelId).catch(() => {});
++    return { posted: false, reason: 'channel_missing' };
++  }
++
++  if (error?.code === DISCORD_MISSING_ACCESS || error?.code === DISCORD_MISSING_PERMISSIONS) {
++    warnMissingPermissions(state, guildId, channelId, ['Send Messages / Embed Links']);
++    return { posted: false, reason: 'permissions' };
++  }
++
++  state.failures += 1;
++  state.blockedUntil = Date.now() + Math.min(MAX_FAILURE_BACKOFF_MS, 30_000 * 2 ** Math.min(state.failures, 5));
++  logger.error('Failed to post sticky', { guildId, channelId, failures: state.failures, error });
++  return { posted: false, reason: 'send_failed' };
++}
++
++function scheduleRepost(client, guildId, channelId, delayMs) {
++  const state = getState(channelId);
++  const now = Date.now();
++
++  if (state.busy) {
++    state.rerun = true;
++    return;
++  }
++
++  if (!state.firstPendingAt) state.firstPendingAt = now;
++  const fireAt = Math.min(now + delayMs, state.firstPendingAt + MAX_WAIT_MS);
++
++  if (state.timer) clearTimeout(state.timer);
++  state.timer = setTimeout(() => {
++    state.timer = null;
++    state.pending = 0;
++    state.firstPendingAt = 0;
++    repostSticky(client, guildId, channelId).catch(() => {});
++  }, Math.max(0, fireAt - now));
++  state.timer.unref?.();
++}
++
++// ---------------------------------------------------------------------------
++// Event hooks (called from the event files)
++// ---------------------------------------------------------------------------
++
++/** Hot path: called for every guild message. Must stay cheap and must never throw. */
++export function notifyStickyMessage(message, client) {
++  try {
++    const guildId = message.guildId;
++    if (!guildId || !message.channelId) return;
++
++    const data = peekGuild(guildId);
++    if (data) {
++      handleMessageWithData(message, client, data);
++      return;
++    }
++
++    loadGuild(client, guildId)
++      .then((loaded) => handleMessageWithData(message, client, loaded))
++      .catch((error) => logger.debug('Sticky notify failed', { error: error?.message }));
++  } catch (error) {
++    logger.debug('Sticky notify failed', { error: error?.message });
++  }
++}
++
++function handleMessageWithData(message, client, data) {
++  const sticky = data.stickies[message.channelId];
++  if (!sticky || !sticky.enabled) return;
++
++  const state = getState(message.channelId);
++
++  // Ignore the sticky itself (the bot's own post), but still react to the bot's other messages
++  // (e.g. slash command replies) since they push the sticky up.
++  if (message.author?.id === client.user?.id) {
++    if (state.busy) return;
++    if (message.id === sticky.lastMessageId || message.id === state.lastMessageId) return;
++    if (state.ownIds.includes(message.id)) return;
++  }
++
++  if (Date.now() < state.blockedUntil) return;
++
++  state.pending += 1;
++  if (state.pending < sticky.everyN) return;
++
++  scheduleRepost(client, message.guildId, message.channelId, sticky.delaySec * 1000);
++}
++
++/** The live sticky message was deleted (by a moderator, purge, etc). Bring it back. */
++export async function handleStickyMessageDeleted(message, client) {
++  try {
++    const guildId = message.guildId;
++    if (!guildId) return;
++
++    const data = await loadGuild(client, guildId);
++    const sticky = data.stickies[message.channelId];
++    if (!sticky) return;
++
++    const state = getState(message.channelId);
++    const isLive = message.id === sticky.lastMessageId || message.id === state.lastMessageId;
++    if (!isLive) return; // e.g. the old sticky we deleted ourselves
++
++    state.lastMessageId = null;
++    await mutateGuild(client, guildId, (draft, ctx) => {
++      const current = draft.stickies[message.channelId];
++      if (!current || current.lastMessageId !== message.id) {
++        ctx.skipWrite = true;
++        return;
++      }
++      current.lastMessageId = null;
++    }).catch((error) => logger.debug('Could not clear deleted sticky id', { error: error?.message }));
++
++    if (sticky.enabled) {
++      scheduleRepost(client, guildId, message.channelId, sticky.delaySec * 1000);
++    }
++  } catch (error) {
++    logger.error('Error handling deleted sticky message', { error });
++  }
++}
++
++export async function handleStickyBulkDelete(messages, channel, client) {
++  try {
++    const guildId = channel?.guildId;
++    if (!guildId) return;
++    const data = await loadGuild(client, guildId);
++    const sticky = data.stickies[channel.id];
++    if (!sticky) return;
++
++    const state = getState(channel.id);
++    const ids = new Set(messages.keys());
++    const hit = ids.has(sticky.lastMessageId) || (state.lastMessageId && ids.has(state.lastMessageId));
++    if (hit) {
++      await handleStickyMessageDeleted(
++        { id: sticky.lastMessageId ?? state.lastMessageId, guildId, channelId: channel.id },
++        client,
++      );
++    }
++  } catch (error) {
++    logger.error('Error handling bulk delete for sticky', { error });
++  }
++}
++
++export async function handleStickyChannelDeleted(channel, client) {
++  try {
++    const guildId = channel?.guildId;
++    if (!guildId || !isStickyChannel(channel)) return;
++    const data = await loadGuild(client, guildId);
++    if (!data.stickies[channel.id]) return;
++    await removeStickyConfigOnly(client, guildId, channel.id);
++    logger.info('Removed sticky for deleted channel', { guildId, channelId: channel.id });
++  } catch (error) {
++    logger.error('Error cleaning up sticky for deleted channel', { error });
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Management API (used by /sticky)
++// ---------------------------------------------------------------------------
++
++function pushHistory(sticky, editedBy) {
++  sticky.history.unshift({
++    title: sticky.title,
++    content: sticky.content,
++    style: sticky.style,
++    color: sticky.color,
++    editedBy: editedBy ?? null,
++    at: Date.now(),
++  });
++  sticky.history = sticky.history.slice(0, STICKY_LIMITS.historySize);
++}
++
++async function removeStickyConfigOnly(client, guildId, channelId) {
++  clearChannelState(channelId);
++  return mutateGuild(client, guildId, (draft, ctx) => {
++    if (!draft.stickies[channelId]) {
++      ctx.skipWrite = true;
++      return null;
++    }
++    const removed = draft.stickies[channelId];
++    delete draft.stickies[channelId];
++    return removed;
++  });
++}
++
++/** Creates a sticky for a channel, or replaces the existing one (keeping history). */
++export async function setSticky(client, guildId, channelId, input, userId) {
++  const sticky = await mutateGuild(client, guildId, (draft) => {
++    const existing = draft.stickies[channelId];
++    if (!existing && Object.keys(draft.stickies).length >= STICKY_LIMITS.maxPerGuild) {
++      throw new StickyError('LIMIT', `This server already has ${STICKY_LIMITS.maxPerGuild} sticky notes. Remove one first.`);
++    }
++
++    // Validate against the style that will actually be used (an existing text sticky stays text).
++    const fields = validateStickyInput(input, {
++      requireContent: true,
++      styleForLengthCheck: input.style ?? existing?.style ?? 'embed',
++    });
++
++    const now = Date.now();
++    if (existing) pushHistory(existing, userId);
++
++    draft.stickies[channelId] = normalizeSticky(
++      {
++        ...(existing ?? {}),
++        title: fields.title ?? '',
++        content: fields.content,
++        style: fields.style ?? existing?.style ?? 'embed',
++        color: fields.color ?? existing?.color ?? null,
++        delaySec: fields.delaySec ?? existing?.delaySec,
++        everyN: fields.everyN ?? existing?.everyN,
++        enabled: true,
++        createdBy: existing?.createdBy ?? userId,
++        createdAt: existing?.createdAt ?? now,
++        updatedAt: now,
++        updatedBy: userId,
++        history: existing?.history ?? [],
++      },
++      channelId,
++    );
++    return draft.stickies[channelId];
++  });
++
++  const result = await repostSticky(client, guildId, channelId, { force: true });
++  return { sticky, result };
++}
++
++/** Changes the text/title of an existing sticky (previous version goes to history). */
++export async function editSticky(client, guildId, channelId, input, userId) {
++  const sticky = await mutateGuild(client, guildId, (draft) => {
++    const existing = draft.stickies[channelId];
++    if (!existing) throw new StickyError('NOT_FOUND', 'There is no sticky note in that channel.');
++
++    const fields = validateStickyInput(input, { requireContent: true, styleForLengthCheck: existing.style });
++    pushHistory(existing, userId);
++    existing.content = fields.content;
++    if (fields.title !== undefined) existing.title = fields.title;
++    existing.updatedAt = Date.now();
++    existing.updatedBy = userId;
++    return existing;
++  });
++
++  const result = await repostSticky(client, guildId, channelId, { force: true });
++  return { sticky, result };
++}
++
++/** Updates style / color / delay / "every N messages" without touching the text. */
++export async function updateStickySettings(client, guildId, channelId, input, userId) {
++  const sticky = await mutateGuild(client, guildId, (draft) => {
++    const existing = draft.stickies[channelId];
++    if (!existing) throw new StickyError('NOT_FOUND', 'There is no sticky note in that channel.');
++
++    const fields = validateStickyInput(
++      { style: input.style, color: input.color, delaySec: input.delaySec, everyN: input.everyN },
++      { styleForLengthCheck: existing.style },
++    );
++
++    const nextStyle = fields.style ?? existing.style;
++    if (nextStyle === 'text') {
++      const total = existing.content.length + (existing.title ? existing.title.length + 8 : 0);
++      if (total > STICKY_LIMITS.maxTextContent) {
++        throw new StickyError('VALIDATION', `This note is too long for the text style (max ${STICKY_LIMITS.maxTextContent} characters).`);
++      }
++    }
++
++    Object.assign(existing, fields);
++    existing.updatedAt = Date.now();
++    existing.updatedBy = userId;
++    return existing;
++  });
++
++  const result = await repostSticky(client, guildId, channelId, { force: true });
++  return { sticky, result };
++}
++
++/** Pauses (deletes the live message, stops reposting) or resumes (reposts right away). */
++export async function setStickyEnabled(client, guildId, channelId, enabled, userId) {
++  return Mutex.runExclusive(`sticky-post:${channelId}`, async () => {
++    const state = getState(channelId);
++    let liveIds = [];
++
++    const sticky = await mutateGuild(client, guildId, (draft) => {
++      const existing = draft.stickies[channelId];
++      if (!existing) throw new StickyError('NOT_FOUND', 'There is no sticky note in that channel.');
++
++      existing.enabled = enabled;
++      existing.updatedAt = Date.now();
++      existing.updatedBy = userId;
++
++      if (!enabled) {
++        liveIds = [existing.lastMessageId, state.lastMessageId].filter(Boolean);
++        existing.lastMessageId = null;
++      }
++      return existing;
++    });
++
++    if (!enabled) {
++      clearChannelTimer(state);
++      state.lastMessageId = null;
++      const resolved = await resolveChannel(client, guildId, channelId).catch(() => ({ channel: null }));
++      if (resolved.channel) {
++        for (const id of new Set(liveIds)) await deleteMessageQuietly(resolved.channel, id);
++      }
++    }
++    return sticky;
++  }).then(async (sticky) => {
++    if (enabled) {
++      const result = await repostSticky(client, guildId, channelId, { force: true });
++      return { sticky, result };
++    }
++    return { sticky, result: { posted: false, reason: 'paused' } };
++  });
++}
++
++/** Removes a sticky entirely and deletes its live message. Returns the removed sticky or null. */
++export async function removeSticky(client, guildId, channelId) {
++  return Mutex.runExclusive(`sticky-post:${channelId}`, async () => {
++    const state = getState(channelId);
++    const extraId = state.lastMessageId;
++    const removed = await removeStickyConfigOnly(client, guildId, channelId);
++    if (!removed) return null;
++
++    const resolved = await resolveChannel(client, guildId, channelId).catch(() => ({ channel: null }));
++    if (resolved.channel) {
++      for (const id of new Set([removed.lastMessageId, extraId].filter(Boolean))) {
++        await deleteMessageQuietly(resolved.channel, id);
++      }
++    }
++    return removed;
++  });
++}
++
++/** Restores one of the saved previous versions (1 = most recent). The current text is saved to history. */
++export async function restoreStickyVersion(client, guildId, channelId, version, userId) {
++  const sticky = await mutateGuild(client, guildId, (draft) => {
++    const existing = draft.stickies[channelId];
++    if (!existing) throw new StickyError('NOT_FOUND', 'There is no sticky note in that channel.');
++
++    const entry = existing.history[version - 1];
++    if (!entry) throw new StickyError('NOT_FOUND', `There is no saved version #${version}.`);
++
++    const snapshot = { ...entry };
++    pushHistory(existing, userId);
++    existing.title = snapshot.title ?? '';
++    existing.content = snapshot.content;
++    existing.style = snapshot.style === 'text' ? 'text' : 'embed';
++    existing.color = normalizeColor(snapshot.color);
++    existing.updatedAt = Date.now();
++    existing.updatedBy = userId;
++    return existing;
++  });
++
++  const result = await repostSticky(client, guildId, channelId, { force: true });
++  return { sticky, result };
++}
++
++// ---------------------------------------------------------------------------
++// Startup reconciliation
++// ---------------------------------------------------------------------------
++
++/**
++ * Runs once on startup: drops stickies whose channel is gone and re-posts stickies that were
++ * buried or deleted while the bot was offline. Sequential and light on API calls.
++ */
++export async function reconcileStickies(client) {
++  const summary = { scannedGuilds: 0, stickies: 0, removed: 0, reposted: 0, errors: 0 };
++
++  for (const guild of client.guilds.cache.values()) {
++    try {
++      // During a Discord outage the guild's channel cache can be empty; never prune in that state.
++      if (!guild.available) continue;
++
++      const data = await loadGuild(client, guild.id);
++      const entries = Object.values(data.stickies);
++      if (entries.length === 0) continue;
++
++      summary.scannedGuilds += 1;
++
++      for (const sticky of entries) {
++        summary.stickies += 1;
++        try {
++          // resolveChannel only reports "missing" for a definite Unknown Channel / wrong-type answer.
++          const resolved = await resolveChannel(client, guild.id, sticky.channelId);
++          if (resolved.missing) {
++            await removeStickyConfigOnly(client, guild.id, sticky.channelId);
++            summary.removed += 1;
++            continue;
++          }
++          const channel = resolved.channel;
++          if (!channel || !sticky.enabled) continue;
++
++          let needsRepost = !sticky.lastMessageId || channel.lastMessageId !== sticky.lastMessageId;
++
++          if (!needsRepost) {
++            // Discord keeps last_message_id even if that message was deleted while we were offline.
++            try {
++              await channel.messages.fetch(sticky.lastMessageId);
++            } catch (error) {
++              if (error?.code === DISCORD_UNKNOWN_MESSAGE) needsRepost = true;
++            }
++          }
++
++          if (needsRepost) {
++            const result = await repostSticky(client, guild.id, sticky.channelId);
++            if (result.posted) summary.reposted += 1;
++          }
++        } catch (error) {
++          summary.errors += 1;
++          logger.warn('Sticky reconcile failed for channel', { guildId: guild.id, channelId: sticky.channelId, error: error?.message });
++        }
++      }
++    } catch (error) {
++      summary.errors += 1;
++      logger.warn('Sticky reconcile failed for guild', { guildId: guild.id, error: error?.message });
++    }
++  }
++
++  return summary;
++}
+diff --git a/src/utils/database/keys.js b/src/utils/database/keys.js
+index 139922d..894c24f 100644
+--- a/src/utils/database/keys.js
++++ b/src/utils/database/keys.js
+@@ -124,6 +124,11 @@ export function getGiveawayLockKey(messageId) {
+     return `giveaway:lock:${messageId}`;
+ }
+ 
++/** All sticky notes for a guild live in one document, keyed by channel ID. */
++export function getStickyKey(guildId) {
++    return `guild:${guildId}:sticky`;
++}
++
+ /**
+  * Legacy key patterns mapped to canonical builders.
+  * Used by migration script and read-time fallback.
+-- 
+2.43.0
+
