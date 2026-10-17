@@ -129,6 +129,16 @@ export function getStickyKey(guildId) {
     return `guild:${guildId}:sticky`;
 }
 
+/** Role matcher: settings, opted-in members and blocks for a guild. */
+export function getRoleMatchKey(guildId) {
+    return `guild:${guildId}:rolematch`;
+}
+
+/** Role matcher: DM requests, cooldowns and daily counters for a guild. */
+export function getRoleMatchRequestsKey(guildId) {
+    return `guild:${guildId}:rolematch:requests`;
+}
+
 /**
  * Legacy key patterns mapped to canonical builders.
  * Used by migration script and read-time fallback.
