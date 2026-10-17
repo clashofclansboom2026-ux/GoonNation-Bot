@@ -19,6 +19,7 @@ import {
   recordCorrectCount,
 } from '../services/countingGameService.js';
 import { notifyStickyMessage } from '../services/stickyService.js';
+import { noteMatcherActivity, maybeRemindDmPreferences } from '../services/roleMatch/roleMatchService.js';
 
 const MESSAGE_XP_RATE_LIMIT_ATTEMPTS = 12;
 const MESSAGE_XP_RATE_LIMIT_WINDOW_MS = 10000;
@@ -32,6 +33,11 @@ export default {
       notifyStickyMessage(message, client);
 
       if (message.author.bot || !message.guild) return;
+
+      // Role matcher: remember who is active, and politely remind people who ask a "DMs Closed"
+      // member to DM them. Both are synchronous, cheap and never throw.
+      noteMatcherActivity(message, client);
+      maybeRemindDmPreferences(message, client);
 
       logger.debug(`Message received from ${message.author.tag}: ${message.content}`);
 
